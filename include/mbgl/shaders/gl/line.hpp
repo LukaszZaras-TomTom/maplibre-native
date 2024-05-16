@@ -6,8 +6,8 @@ namespace mbgl {
 namespace shaders {
 
 template <>
-struct ShaderSource<BuiltIn::LineProgram, gfx::Backend::Type::OpenGL> {
-    static constexpr const char* name = "LineProgram";
+struct ShaderSource<BuiltIn::LineSDFProgram, gfx::Backend::Type::OpenGL> {
+    static constexpr const char* name = "LineSDFProgram";
     static constexpr const char* vertex = R"(// floor(127 / 2) == 63.0
 // the maximum allowed miter limit is 2.0 at the moment. the extrude normal is
 // stored in a byte (-128..127). we scale regular normals up to length 63, but
@@ -16,18 +16,27 @@ struct ShaderSource<BuiltIn::LineProgram, gfx::Backend::Type::OpenGL> {
 // #define scale 63.0
 #define scale 0.015873016
 
+// We scale the distance before adding it to the buffers so that we can store
+// long distances for long segments. Use this value to unscale the distance.
+#define LINE_DISTANCE_SCALE 2.0
+
 layout (location = 0) in vec2 a_pos_normal;
 layout (location = 1) in vec4 a_data;
 
 uniform mat4 u_matrix;
 uniform mediump float u_ratio;
-uniform vec2 u_units_to_pixels;
 uniform lowp float u_device_pixel_ratio;
+uniform vec2 u_patternscale_a;
+uniform float u_tex_y_a;
+uniform vec2 u_patternscale_b;
+uniform float u_tex_y_b;
+uniform vec2 u_units_to_pixels;
 
 out vec2 v_normal;
 out vec2 v_width2;
+out vec2 v_tex_a;
+out vec2 v_tex_b;
 out float v_gamma_scale;
-out highp float v_linesofar;
 
 #ifndef HAS_UNIFORM_u_color
 uniform lowp float u_color_t;
@@ -65,8 +74,16 @@ uniform lowp float u_offset;
 #ifndef HAS_UNIFORM_u_width
 uniform lowp float u_width_t;
 layout (location = 7) in mediump vec2 a_width;
+out mediump float width;
 #else
 uniform mediump float u_width;
+#endif
+#ifndef HAS_UNIFORM_u_floorwidth
+uniform lowp float u_floorwidth_t;
+layout (location = 8) in lowp vec2 a_floorwidth;
+out lowp float floorwidth;
+#else
+uniform lowp float u_floorwidth;
 #endif
 
 void main() {
@@ -96,9 +113,14 @@ lowp float offset = unpack_mix_vec2(a_offset, u_offset_t);
 lowp float offset = u_offset;
 #endif
     #ifndef HAS_UNIFORM_u_width
-mediump float width = unpack_mix_vec2(a_width, u_width_t);
+width = unpack_mix_vec2(a_width, u_width_t);
 #else
 mediump float width = u_width;
+#endif
+    #ifndef HAS_UNIFORM_u_floorwidth
+floorwidth = unpack_mix_vec2(a_floorwidth, u_floorwidth_t);
+#else
+lowp float floorwidth = u_floorwidth;
 #endif
 
     // the distance over which the line edge fades out.
@@ -107,8 +129,7 @@ mediump float width = u_width;
 
     vec2 a_extrude = a_data.xy - 128.0;
     float a_direction = mod(a_data.z, 4.0) - 1.0;
-
-    v_linesofar = (floor(a_data.z / 4.0) + a_data.w * 64.0) * 2.0;
+    float a_linesofar = (floor(a_data.z / 4.0) + a_data.w * 64.0) * LINE_DISTANCE_SCALE;
 
     vec2 pos = floor(a_pos_normal * 0.5);
 
@@ -130,7 +151,7 @@ mediump float width = u_width;
 
     // Scale the extrusion vector down to a normal and then up by the line width
     // of this vertex.
-    mediump vec2 dist = outset * a_extrude * scale;
+    mediump vec2 dist =outset * a_extrude * scale;
 
     // Calculate the offset when drawing a line that is to the side of the actual line.
     // We do this by creating a vector that points towards the extrude, but rotate
@@ -148,13 +169,22 @@ mediump float width = u_width;
     float extrude_length_with_perspective = length(projected_extrude.xy / gl_Position.w * u_units_to_pixels);
     v_gamma_scale = extrude_length_without_perspective / extrude_length_with_perspective;
 
+    v_tex_a = vec2(a_linesofar * u_patternscale_a.x / floorwidth, normal.y * u_patternscale_a.y + u_tex_y_a);
+    v_tex_b = vec2(a_linesofar * u_patternscale_b.x / floorwidth, normal.y * u_patternscale_b.y + u_tex_y_b);
+
     v_width2 = vec2(outset, inset);
 }
 )";
-    static constexpr const char* fragment = R"(uniform lowp float u_device_pixel_ratio;
+    static constexpr const char* fragment = R"(
+uniform lowp float u_device_pixel_ratio;
+uniform sampler2D u_image;
+uniform float u_sdfgamma;
+uniform float u_mix;
 
-in vec2 v_width2;
 in vec2 v_normal;
+in vec2 v_width2;
+in vec2 v_tex_a;
+in vec2 v_tex_b;
 in float v_gamma_scale;
 
 #ifndef HAS_UNIFORM_u_color
@@ -172,6 +202,16 @@ in lowp float opacity;
 #else
 uniform lowp float u_opacity;
 #endif
+#ifndef HAS_UNIFORM_u_width
+in mediump float width;
+#else
+uniform mediump float u_width;
+#endif
+#ifndef HAS_UNIFORM_u_floorwidth
+in lowp float floorwidth;
+#else
+uniform lowp float u_floorwidth;
+#endif
 
 void main() {
     #ifdef HAS_UNIFORM_u_color
@@ -183,6 +223,12 @@ lowp float blur = u_blur;
     #ifdef HAS_UNIFORM_u_opacity
 lowp float opacity = u_opacity;
 #endif
+    #ifdef HAS_UNIFORM_u_width
+mediump float width = u_width;
+#endif
+    #ifdef HAS_UNIFORM_u_floorwidth
+lowp float floorwidth = u_floorwidth;
+#endif
 
     // Calculate the distance of the pixel from the line in pixels.
     float dist = length(v_normal) * v_width2.s;
@@ -193,7 +239,12 @@ lowp float opacity = u_opacity;
     float blur2 = (blur + 1.0 / u_device_pixel_ratio) * v_gamma_scale;
     float alpha = clamp(min(dist - (v_width2.t - blur2), v_width2.s - dist) / blur2, 0.0, 1.0);
 
-    fragColor = color * (alpha * opacity);
+    float sdfdist_a = texture(u_image, v_tex_a).a;
+    float sdfdist_b = texture(u_image, v_tex_b).a;
+    float sdfdist = mix(sdfdist_a, sdfdist_b, u_mix);
+    alpha *= smoothstep(0.5 - u_sdfgamma / floorwidth, 0.5 + u_sdfgamma / floorwidth, sdfdist);
+
+    fragColor = color;
 
 #ifdef OVERDRAW_INSPECTOR
     fragColor = vec4(1.0);

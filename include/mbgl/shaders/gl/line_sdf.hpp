@@ -244,7 +244,7 @@ lowp float floorwidth = u_floorwidth;
     float sdfdist = mix(sdfdist_a, sdfdist_b, u_mix);
     alpha *= smoothstep(0.5 - u_sdfgamma / floorwidth, 0.5 + u_sdfgamma / floorwidth, sdfdist);
 
-    fragColor = color * (alpha * opacity);
+    fragColor = color;
 
 #ifdef OVERDRAW_INSPECTOR
     fragColor = vec4(1.0);
